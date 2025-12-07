@@ -9,16 +9,17 @@
 # is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 # or implied. See the License for the specific language governing permissions and limitations under the License.
 
-FROM ubuntu:jammy-20240530
+FROM ubuntu:jammy-20251013
 
 ARG TARGETARCH
 ARG MILVUS_ASAN_LIB
 
-# Install ca-certificates first, then switch to HTTPS and install other packages
+# Install ca-certificates first, then switch to HTTPS, upgrade for security patches, and install other packages
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     sed -i 's/http:/https:/g' /etc/apt/sources.list && \
     apt-get update && \
+    apt-get upgrade -y && \
     apt-get install -y --no-install-recommends curl libaio-dev libgomp1 libopenblas-dev && \
     apt-get remove --purge -y && \
     rm -rf /var/lib/apt/lists/*
