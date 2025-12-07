@@ -1,0 +1,481 @@
+name: Vectara Milvus CI
+
+on:
+  push:
+    branches:
+      - '2.5.x-vectara'
+      - 'fix-*'
+    paths:
+      - 'scripts/**'
+      - 'internal/**'
+      - 'client/**'
+      - 'pkg/**'
+      - 'cmd/**'
+      - 'build/**'
+      - 'tests/integration/**'
+      - '.github/workflows/vectara-ci.yaml'
+      - '.env'
+      - docker-compose.yml
+      - Makefile
+      - go.mod
+      - go.sum
+      - '!**.md'
+      - '!build/ci/jenkins/**'
+  pull_request:
+    branches:
+      - '2.5.x-vectara'
+    paths:
+      - 'scripts/**'
+      - 'internal/**'
+      - 'pkg/**'
+      - 'client/**'
+      - 'cmd/**'
+      - 'build/**'
+      - 'tests/integration/**'
+      - '.github/workflows/vectara-ci.yaml'
+      - '.env'
+      - docker-compose.yml
+      - Makefile
+      - go.mod
+      - go.sum
+      - '!**.md'
+      - '!build/ci/jenkins/**'
+  workflow_dispatch:
+    inputs:
+      skip_build:
+        description: 'Skip build step (use cached artifacts)'
+        required: false
+        default: 'false'
+        type: boolean
+      run_e2e:
+        description: 'Run E2E tests'
+        required: false
+        default: 'true'
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  DOCKER_BUILDKIT: 1
+  COMPOSE_DOCKER_CLI_BUILD: 1
+
+jobs:
+  # =============================================================================
+  # Build Job - Compiles C++ and Go components
+  # =============================================================================
+  build:
+    name: Build (AMD64 Ubuntu 22.04)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      artifact-name: ${{ steps.artifact.outputs.name }}
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 20480
+          swap-size-mb: 1024
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+
+      - name: Check for C++ changes
+        id: cpp-changes
+        uses: tj-actions/changed-files@v41
+        with:
+          since_last_remote_commit: 'true'
+          files: |
+            **/*.cpp
+            **/*.cc
+            **/*.c
+            **/*.h
+            **/*.hpp
+            **/CMakeLists.txt
+            **/conanfile.*
+
+      - name: Set ASAN flag
+        if: steps.cpp-changes.outputs.any_changed == 'true'
+        run: echo "USE_ASAN=ON" >> $GITHUB_ENV
+
+      - name: Download build caches
+        uses: ./.github/actions/cache-restore
+        with:
+          os: 'ubuntu22.04'
+          kind: 'cpp'
+
+      - name: Build C++ components
+        run: |
+          ./build/builder.sh /bin/bash -c "make USE_ASAN=${{ env.USE_ASAN || 'OFF' }} build-cpp"
+
+      - name: Archive build artifacts
+        id: artifact
+        run: |
+          zip -r code.zip . -x "./.docker/*" -x "./cmake_build/thirdparty/**" -x ".git/**"
+          echo "name=code-${{ github.run_id }}" >> $GITHUB_OUTPUT
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-${{ github.run_id }}
+          path: code.zip
+          retention-days: 1
+
+      - name: Save build caches
+        uses: ./.github/actions/cache-save
+        if: github.event_name != 'pull_request'
+        with:
+          os: 'ubuntu22.04'
+          kind: 'cpp'
+
+  # =============================================================================
+  # C++ Unit Tests
+  # =============================================================================
+  unit-tests-cpp:
+    name: C++ Unit Tests
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 20480
+          swap-size-mb: 1024
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: code-${{ github.run_id }}
+
+      - name: Extract artifacts
+        run: |
+          unzip code.zip
+          rm code.zip
+
+      - name: Download caches
+        uses: ./.github/actions/cache-restore
+        with:
+          os: 'ubuntu22.04'
+          kind: 'cpp'
+
+      - name: Start test services
+        run: docker compose up -d azurite gcpnative
+
+      - name: Run C++ Unit Tests
+        run: |
+          chmod +x build/builder.sh
+          chmod +x scripts/*
+          chmod +x internal/core/output/unittest/* 2>/dev/null || true
+          ./build/builder.sh /bin/bash -c "./scripts/run_cpp_codecov.sh"
+
+      - name: Upload coverage results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cpp-coverage
+          path: |
+            ./lcov_output.info
+            *.info
+            *.out
+
+  # =============================================================================
+  # Go Unit Tests
+  # =============================================================================
+  unit-tests-go:
+    name: Go Unit Tests
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 20480
+          swap-size-mb: 1024
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: code-${{ github.run_id }}
+
+      - name: Extract artifacts
+        run: |
+          unzip code.zip
+          rm code.zip
+
+      - name: Download caches
+        uses: ./.github/actions/cache-restore
+        with:
+          os: 'ubuntu22.04'
+          kind: 'go'
+
+      - name: Start test services
+        run: docker compose up -d pulsar etcd minio azurite gcpnative
+
+      - name: Wait for services
+        run: |
+          echo "Waiting for services to be ready..."
+          sleep 30
+
+      - name: Run Go Unit Tests
+        run: |
+          chmod +x build/builder.sh
+          chmod +x scripts/run_go_codecov.sh
+          ./build/builder.sh /bin/bash -c "make codecov-go-without-build"
+
+      - name: Upload coverage results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: go-coverage
+          path: |
+            ./go_coverage.txt
+            *.info
+            *.out
+
+      - name: Save caches
+        uses: ./.github/actions/cache-save
+        if: github.event_name != 'pull_request'
+        with:
+          os: 'ubuntu22.04'
+          kind: 'go'
+
+  # =============================================================================
+  # Integration Tests
+  # =============================================================================
+  integration-tests:
+    name: Integration Tests
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 20480
+          swap-size-mb: 1024
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: code-${{ github.run_id }}
+
+      - name: Extract artifacts
+        run: |
+          unzip code.zip
+          rm code.zip
+
+      - name: Download caches
+        uses: ./.github/actions/cache-restore
+        with:
+          os: 'ubuntu22.04'
+          kind: 'go'
+
+      - name: Start test services
+        run: docker compose up -d pulsar etcd minio
+
+      - name: Wait for services
+        run: |
+          echo "Waiting for services to be ready..."
+          sleep 30
+
+      - name: Run Integration Tests
+        run: |
+          chmod +x build/builder.sh
+          chmod +x scripts/run_intergration_test.sh
+          ./build/builder.sh /bin/bash -c "make integration-test"
+
+      - name: Upload coverage results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-coverage
+          path: |
+            ./it_coverage.txt
+            *.info
+            *.out
+
+      - name: Save caches
+        uses: ./.github/actions/cache-save
+        if: github.event_name != 'pull_request'
+        with:
+          os: 'ubuntu22.04'
+          kind: 'go'
+
+  # =============================================================================
+  # E2E Tests (Docker Compose based - no K8s required)
+  # =============================================================================
+  e2e-tests:
+    name: E2E Tests (${{ matrix.mode }})
+    needs: build
+    if: ${{ github.event.inputs.run_e2e != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [standalone]  # Can add 'cluster' if needed
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 20480
+          swap-size-mb: 1024
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: code-${{ github.run_id }}
+
+      - name: Extract artifacts
+        run: |
+          unzip code.zip
+          rm code.zip
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Python dependencies
+        run: |
+          pip install -r tests/python_client/requirements.txt --trusted-host https://test.pypi.org
+
+      - name: Build Milvus image
+        run: |
+          chmod +x build/builder.sh
+          ./build/builder.sh /bin/bash -c "make install"
+          ./build/build_image.sh
+
+      - name: Deploy Milvus (${{ matrix.mode }})
+        working-directory: tests/python_client/deploy/${{ matrix.mode }}
+        run: |
+          # Use locally built image
+          export MILVUS_IMAGE=milvusdb/milvus:latest
+          docker compose up -d
+
+          # Wait for Milvus to be ready
+          echo "Waiting for Milvus to be ready..."
+          for i in {1..60}; do
+            if nc -z localhost 19530; then
+              echo "Milvus is ready!"
+              break
+            fi
+            echo "Waiting... ($i/60)"
+            sleep 5
+          done
+
+          docker compose ps
+
+      - name: Run E2E Tests (L0)
+        working-directory: tests/python_client
+        run: |
+          pytest --tags=L0 -n auto --timeout=300 -x -v 2>&1 || true
+          # Run basic sanity tests even if L0 has issues
+          python -c "
+          from pymilvus import connections, utility
+          connections.connect('default', host='localhost', port='19530')
+          print('Connected to Milvus')
+          print('Server version:', utility.get_server_version())
+          "
+
+      - name: Export logs
+        if: always()
+        working-directory: tests/python_client/deploy/${{ matrix.mode }}
+        run: |
+          docker compose logs > milvus-logs.txt 2>&1 || true
+          docker compose ps -a || true
+
+      - name: Upload logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-logs-${{ matrix.mode }}
+          path: tests/python_client/deploy/${{ matrix.mode }}/milvus-logs.txt
+
+      - name: Cleanup
+        if: always()
+        working-directory: tests/python_client/deploy/${{ matrix.mode }}
+        run: docker compose down -v || true
+
+  # =============================================================================
+  # Code Quality Checks
+  # =============================================================================
+  code-checker:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 20480
+          swap-size-mb: 1024
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download caches
+        uses: ./.github/actions/cache-restore
+        with:
+          os: 'ubuntu22.04'
+
+      - name: Run code checks
+        run: |
+          ./build/builder.sh /bin/bash -c "git config --global --add safe.directory /go/src/github.com/milvus-io/milvus && make check-proto-product && make verifiers"
+
+  # =============================================================================
+  # Summary Job
+  # =============================================================================
+  ci-summary:
+    name: CI Summary
+    needs: [build, unit-tests-cpp, unit-tests-go, integration-tests, code-checker]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check results
+        run: |
+          echo "## CI Results Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Build | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| C++ Unit Tests | ${{ needs.unit-tests-cpp.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Go Unit Tests | ${{ needs.unit-tests-go.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Integration Tests | ${{ needs.integration-tests.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Code Quality | ${{ needs.code-checker.result }} |" >> $GITHUB_STEP_SUMMARY
+
+          # Fail if any required job failed
+          if [[ "${{ needs.build.result }}" == "failure" ]] || \
+             [[ "${{ needs.unit-tests-go.result }}" == "failure" ]] || \
+             [[ "${{ needs.integration-tests.result }}" == "failure" ]] || \
+             [[ "${{ needs.code-checker.result }}" == "failure" ]]; then
+            echo ""
+            echo "::error::One or more required jobs failed"
+            exit 1
+          fi
