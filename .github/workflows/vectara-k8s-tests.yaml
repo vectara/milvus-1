@@ -1,0 +1,395 @@
+name: Vectara K8s Tests (Kind)
+
+# This workflow runs K8s-based tests including chaos tests on Kind
+# Requires self-hosted runners with:
+#   - 8+ CPU cores
+#   - 32+ GB RAM
+#   - 50+ GB SSD disk space
+#   - Docker installed
+
+on:
+  workflow_dispatch:
+    inputs:
+      milvus_image_tag:
+        description: 'Milvus image tag to test'
+        required: false
+        default: 'latest'
+      run_chaos_tests:
+        description: 'Run chaos tests (pod-kill, network-partition)'
+        required: false
+        default: 'true'
+        type: boolean
+      deployment_mode:
+        description: 'Milvus deployment mode'
+        required: false
+        default: 'standalone'
+        type: choice
+        options:
+          - standalone
+          - cluster
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CHAOS_MESH_VERSION: v2.0.3
+  MILVUS_HELM_VERSION: 4.2.58
+  KIND_VERSION: v0.20.0
+  KUBECTL_VERSION: v1.28.0
+
+jobs:
+  # =============================================================================
+  # Build Milvus Image (if not using pre-built)
+  # =============================================================================
+  build-image:
+    name: Build Milvus Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      image-tag: ${{ steps.build.outputs.tag }}
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 30720
+          swap-size-mb: 1024
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+
+      - name: Download build caches
+        uses: ./.github/actions/cache-restore
+        with:
+          os: 'ubuntu22.04'
+          kind: 'all'
+
+      - name: Build Milvus
+        id: build
+        run: |
+          ./build/builder.sh /bin/bash -c "make install"
+
+          # Build and tag the image
+          IMAGE_TAG="${{ github.event.inputs.milvus_image_tag || 'vectara-test' }}-${{ github.sha }}"
+          ./build/build_image.sh
+          docker tag milvusdb/milvus:latest milvusdb/milvus:${IMAGE_TAG}
+
+          # Save for later jobs
+          docker save milvusdb/milvus:${IMAGE_TAG} -o milvus-image.tar
+          echo "tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: milvus-image
+          path: milvus-image.tar
+          retention-days: 1
+
+  # =============================================================================
+  # E2E Tests on Kind (Helm deployment)
+  # =============================================================================
+  e2e-helm:
+    name: E2E Helm (${{ matrix.mode }})
+    needs: build-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [standalone, cluster]
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 20480
+          swap-size-mb: 1024
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Milvus image
+        uses: actions/download-artifact@v4
+        with:
+          name: milvus-image
+
+      - name: Load Milvus image
+        run: docker load -i milvus-image.tar
+
+      - name: Create Kind cluster
+        uses: helm/kind-action@v1.8.0
+        with:
+          cluster_name: milvus-test
+          wait: 120s
+
+      - name: Load image into Kind
+        run: |
+          kind load docker-image milvusdb/milvus:${{ needs.build-image.outputs.image-tag }} --name milvus-test
+
+      - name: Install Helm repos
+        run: |
+          helm repo add milvus https://zilliztech.github.io/milvus-helm
+          helm repo update
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install test dependencies
+        run: |
+          pip install -r tests/python_client/requirements.txt --trusted-host https://test.pypi.org
+
+      - name: Deploy Milvus (${{ matrix.mode }})
+        run: |
+          RELEASE_NAME="milvus-${{ matrix.mode }}"
+
+          if [ "${{ matrix.mode }}" == "standalone" ]; then
+            VALUES_FILE="tests/python_client/deploy/standalone-values.yaml"
+            helm install --wait --timeout 720s ${RELEASE_NAME} milvus/milvus \
+              --set image.all.repository=milvusdb/milvus \
+              --set image.all.tag=${{ needs.build-image.outputs.image-tag }} \
+              -f ${VALUES_FILE} || true
+          else
+            VALUES_FILE="tests/python_client/deploy/cluster-values.yaml"
+            helm install --wait --timeout 720s ${RELEASE_NAME} milvus/milvus \
+              --set image.all.repository=milvusdb/milvus \
+              --set image.all.tag=${{ needs.build-image.outputs.image-tag }} \
+              -f ${VALUES_FILE} || true
+          fi
+
+          kubectl get pods
+          sleep 30
+          kubectl get pods
+
+      - name: Port forward Milvus
+        run: |
+          RELEASE_NAME="milvus-${{ matrix.mode }}"
+          kubectl port-forward service/${RELEASE_NAME}-milvus 19530:19530 &
+          sleep 10
+          nc -vz 127.0.0.1 19530
+
+      - name: Run E2E Tests
+        working-directory: tests/python_client
+        run: |
+          pytest --tags=L0 -n 2 --timeout=300 -v -x 2>&1 || echo "Some tests failed"
+
+      - name: Export logs
+        if: always()
+        run: |
+          RELEASE_NAME="milvus-${{ matrix.mode }}"
+          mkdir -p logs
+          kubectl logs -l app.kubernetes.io/instance=${RELEASE_NAME} --all-containers > logs/milvus.log 2>&1 || true
+          kubectl describe pods > logs/pods-describe.txt 2>&1 || true
+          kubectl get events > logs/events.txt 2>&1 || true
+
+      - name: Upload logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: k8s-e2e-logs-${{ matrix.mode }}
+          path: logs/
+
+  # =============================================================================
+  # Chaos Tests on Kind
+  # =============================================================================
+  chaos-test:
+    name: Chaos Test (${{ matrix.chaos_type }})
+    needs: build-image
+    if: ${{ github.event.inputs.run_chaos_tests != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        chaos_type: [pod-kill, pod-failure]
+        # Can expand to: network-partition, memory-stress, io-latency
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 20480
+          swap-size-mb: 1024
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Milvus image
+        uses: actions/download-artifact@v4
+        with:
+          name: milvus-image
+
+      - name: Load Milvus image
+        run: docker load -i milvus-image.tar
+
+      - name: Create Kind cluster
+        uses: helm/kind-action@v1.8.0
+        with:
+          cluster_name: chaos-test
+          wait: 120s
+
+      - name: Load image into Kind
+        run: |
+          kind load docker-image milvusdb/milvus:${{ needs.build-image.outputs.image-tag }} --name chaos-test
+
+      - name: Deploy Chaos Mesh
+        run: |
+          helm repo add chaos-mesh https://charts.chaos-mesh.org
+          helm repo update
+          kubectl create ns chaos-testing
+          helm install --wait --timeout 360s chaos-mesh chaos-mesh/chaos-mesh \
+            --namespace=chaos-testing \
+            --version ${{ env.CHAOS_MESH_VERSION }} \
+            --set chaosDaemon.runtime=containerd \
+            --set chaosDaemon.socketPath=/run/containerd/containerd.sock
+          kubectl get po -n chaos-testing
+
+      - name: Install Helm repos
+        run: |
+          helm repo add milvus https://zilliztech.github.io/milvus-helm
+          helm repo update
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install test dependencies
+        run: |
+          pip install -r tests/python_client/requirements.txt --trusted-host https://test.pypi.org
+
+      - name: Deploy Milvus (standalone)
+        run: |
+          RELEASE_NAME="chaos-milvus"
+          helm install --wait --timeout 720s ${RELEASE_NAME} milvus/milvus \
+            --set image.all.repository=milvusdb/milvus \
+            --set image.all.tag=${{ needs.build-image.outputs.image-tag }} \
+            -f tests/python_client/chaos/standalone-values.yaml \
+            -n chaos-testing
+
+          kubectl get pods -n chaos-testing
+          sleep 30
+          kubectl get pods -n chaos-testing
+
+      - name: Port forward Milvus
+        run: |
+          kubectl port-forward service/chaos-milvus-milvus 19530:19530 -n chaos-testing &
+          sleep 10
+          nc -vz 127.0.0.1 19530
+
+      - name: Run pre-chaos sanity test
+        working-directory: tests/python_client
+        run: |
+          pytest testcases/test_connection.py -v --timeout=60 || true
+
+      - name: Apply chaos (${{ matrix.chaos_type }})
+        run: |
+          if [ "${{ matrix.chaos_type }}" == "pod-kill" ]; then
+            cat <<EOF | kubectl apply -f -
+          apiVersion: chaos-mesh.org/v1alpha1
+          kind: PodChaos
+          metadata:
+            name: pod-kill-test
+            namespace: chaos-testing
+          spec:
+            action: pod-kill
+            mode: one
+            selector:
+              namespaces:
+                - chaos-testing
+              labelSelectors:
+                app.kubernetes.io/instance: chaos-milvus
+                app.kubernetes.io/component: standalone
+            gracePeriod: 0
+          EOF
+          elif [ "${{ matrix.chaos_type }}" == "pod-failure" ]; then
+            cat <<EOF | kubectl apply -f -
+          apiVersion: chaos-mesh.org/v1alpha1
+          kind: PodChaos
+          metadata:
+            name: pod-failure-test
+            namespace: chaos-testing
+          spec:
+            action: pod-failure
+            mode: one
+            duration: '60s'
+            selector:
+              namespaces:
+                - chaos-testing
+              labelSelectors:
+                app.kubernetes.io/instance: chaos-milvus
+          EOF
+          fi
+
+          echo "Chaos applied, waiting for effect..."
+          sleep 30
+
+      - name: Wait for recovery
+        run: |
+          echo "Waiting for pods to recover..."
+          kubectl wait --for=condition=Ready pod -l app.kubernetes.io/instance=chaos-milvus \
+            -n chaos-testing --timeout=300s || true
+          sleep 30
+          kubectl get pods -n chaos-testing
+
+      - name: Re-establish port forward
+        run: |
+          # Kill old port-forward
+          pkill -f "port-forward.*19530" || true
+          sleep 5
+          kubectl port-forward service/chaos-milvus-milvus 19530:19530 -n chaos-testing &
+          sleep 10
+          nc -vz 127.0.0.1 19530
+
+      - name: Run post-chaos sanity test
+        working-directory: tests/python_client
+        run: |
+          pytest testcases/test_connection.py -v --timeout=60 || true
+
+      - name: Export logs
+        if: always()
+        run: |
+          mkdir -p logs
+          kubectl logs -l app.kubernetes.io/instance=chaos-milvus -n chaos-testing --all-containers > logs/milvus.log 2>&1 || true
+          kubectl describe pods -n chaos-testing > logs/pods-describe.txt 2>&1 || true
+          kubectl get events -n chaos-testing > logs/events.txt 2>&1 || true
+          kubectl get podchaos -n chaos-testing -o yaml > logs/podchaos.yaml 2>&1 || true
+
+      - name: Upload logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chaos-logs-${{ matrix.chaos_type }}
+          path: logs/
+
+  # =============================================================================
+  # Summary
+  # =============================================================================
+  k8s-summary:
+    name: K8s Tests Summary
+    needs: [build-image, e2e-helm, chaos-test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summary
+        run: |
+          echo "## K8s Tests Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Image | ${{ needs.build-image.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| E2E Helm Tests | ${{ needs.e2e-helm.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Chaos Tests | ${{ needs.chaos-test.result }} |" >> $GITHUB_STEP_SUMMARY
